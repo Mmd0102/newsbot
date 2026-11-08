@@ -2,11 +2,11 @@ name: News
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # هر ۱۵ دقیقه (گیت‌هاب ممکن است چند دقیقه تأخیر داشته باشد)
+    - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
       test:
-        description: "فقط بررسی فیدها (چیزی ارسال نمی‌شود)"
+        description: "test only"
         type: boolean
         default: false
 
@@ -32,6 +32,7 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHANNEL: ${{ secrets.CHANNEL }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TEST: ${{ inputs.test && '1' || '0' }}
         run: python news_bot.py
 
