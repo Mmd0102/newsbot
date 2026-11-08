@@ -84,6 +84,15 @@ def clean_html(t) -> str:
     return re.sub(r"\s+", " ", html.unescape(t)).strip()
 
 
+EXTRA_RE = re.compile(r"\s*[+＋]\s*(?:عکس|تصویر|تصاویر|فیلم|ویدیو|ویدئو|گزارش تصویری)(?:\s*ها)?\s*(?=[\s!؟?.،:|)\]]|$)")
+
+
+def strip_extras(title: str) -> str:
+    """عبارت‌هایی مثل «+عکس» یا «+فیلم» را از عنوان خبر حذف می‌کند."""
+    t = re.sub(r"\s+", " ", EXTRA_RE.sub(" ", title)).strip()
+    return re.sub(r"\s+([!؟?.،:])", r"\1", t)
+
+
 def is_persian(text: str) -> bool:
     letters = [c for c in text if c.isalpha()]
     return bool(letters) and sum("؀" <= c <= "ۿ" for c in letters) / len(letters) > 0.4
@@ -93,7 +102,7 @@ def parse_feed(xml_bytes: bytes, source: str, emoji: str):
     root = ET.fromstring(xml_bytes)
     items = []
     for it in root.iter("item"):
-        title = clean_html(it.findtext("title"))
+        title = strip_extras(clean_html(it.findtext("title")))
         link = (it.findtext("link") or "").strip()
         if not title or not link:
             continue
@@ -107,6 +116,7 @@ def parse_feed(xml_bytes: bytes, source: str, emoji: str):
             except Exception:
                 pass
         image, best_w, video = None, -1, None
+        imgs = []
         for e in it.iter():
             tag = e.tag.split("}")[-1]
             if tag not in ("thumbnail", "content", "enclosure"):
@@ -124,6 +134,7 @@ def parse_feed(xml_bytes: bytes, source: str, emoji: str):
                 w = int(e.get("width") or 0)
             except ValueError:
                 w = 0
+            imgs.append(u)
             if w >= best_w:
                 image, best_w = u, w
         if not video:  # ویدیو داخل متن خبر
@@ -132,9 +143,30 @@ def parse_feed(xml_bytes: bytes, source: str, emoji: str):
         if not image:  # عکس داخل متن خبر
             m = re.search(r'<img[^>]+src=["\']([^"\']+)', raw, re.I)
             image = m.group(1) if m else None
+        imgs += re.findall(r'<img[^>]+src=["\']([^"\']+)', raw, re.I)
         items.append({"title": title, "link": link, "summary": clean_html(raw),
-                      "ts": ts, "image": image, "video": video, "source": source, "emoji": emoji})
+                      "ts": ts, "image": image, "images": pick_images(image, imgs),
+                      "video": video, "source": source, "emoji": emoji})
     return items
+
+
+JUNK_RE = re.compile(r"logo|icon|avatar|pixel|spacer|sprite|banner|emoji|\.gif|\.svg|/ads?/", re.I)
+
+
+def pick_images(main, urls, limit: int = 5):
+    """عکس اصلی + عکس‌های دیگر خبر (بدون تکراری و آیکون)؛ برای ارسال آلبوم."""
+    out, seen = [], set()
+    for u in ([main] if main else []) + urls:
+        if u.startswith("//"):
+            u = "https:" + u
+        if not u.startswith("http") or JUNK_RE.search(u):
+            continue
+        key = u.split("?")[0].rsplit("/", 1)[-1].lower()  # نسخه‌های هم‌اندازهٔ یک عکس را یکی بگیر
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(u)
+    return out[:limit]
 
 
 def load_feeds():
@@ -167,6 +199,57 @@ def translate_fa(text: str) -> str:
     return out
 
 
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+
+
+def gemini_translate(title: str, summary: str):
+    """ترجمهٔ روان به سبک رسانه‌های ورزشی ایران (اختیاری، با کلید رایگان Gemini)."""
+    prompt = (
+        "You are a professional Persian (Farsi) sports journalist working for an Iranian sports outlet. "
+        "Translate the football/sports news headline and summary below into fluent, natural, concise Persian, "
+        "the way Iranian sports media (like Varzesh3) would write it. Use the common Persian spellings of "
+        "player, coach, club, league and country names. Do not add facts or opinions. Keep the summary to "
+        "at most 3 short sentences. If the summary is empty, return an empty string for it. "
+        'Reply only with JSON: {"title": "...", "summary": "..."}\n\n'
+        + json.dumps({"title": title, "summary": summary}, ensure_ascii=False))
+    body = {"contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2}}
+    req = urllib.request.Request(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_KEY})
+    try:
+        with urllib.request.urlopen(req, timeout=45) as r:
+            data = json.loads(r.read().decode())
+        obj = json.loads(data["candidates"][0]["content"]["parts"][0]["text"])
+        t = str(obj.get("title", "")).strip()
+        sm = str(obj.get("summary", "")).strip()
+    except Exception as e:
+        raise TranslateError("gemini:" + type(e).__name__)
+    if not t:
+        raise TranslateError("gemini:empty")
+    return t, sm
+
+
+def translate_item(it: dict):
+    """(عنوان، خلاصه) فارسی. اگر Gemini تنظیم باشد با آن، وگرنه/در خطا با ترجمهٔ گوگل."""
+    summary_src = "" if it["summary"].startswith(it["title"][:40]) else it["summary"][:500]
+    if is_persian(it["title"]) and (not summary_src or is_persian(summary_src)):
+        return it["title"], summary_src
+    if GEMINI_KEY:
+        try:
+            return gemini_translate(it["title"], summary_src)
+        except TranslateError as e:
+            print("  Gemini جواب نداد، ترجمهٔ ساده:", e)
+    title = to_persian(it["title"])
+    try:
+        summary = to_persian(summary_src)
+    except TranslateError:
+        summary = ""
+    return title, summary
+
+
 def to_persian(text: str) -> str:
     return text if (not text or is_persian(text)) else translate_fa(text)
 
@@ -175,14 +258,38 @@ def upgrade_image(url: str) -> str:
     return re.sub(r"/standard/\d+/", "/standard/976/", url) if "ichef.bbci.co.uk" in url else url
 
 
-def og_image(link: str):
-    try:
-        page = http_get(link, timeout=10, limit=300_000).decode("utf-8", "ignore")
-    except Exception:
-        return None
-    m = (re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', page)
-         or re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', page))
+def _meta(page: str, prop: str):
+    m = (re.search(r'<meta[^>]+(?:property|name)=["\']%s["\'][^>]+content=["\']([^"\']+)' % re.escape(prop), page, re.I)
+         or re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']%s["\']' % re.escape(prop), page, re.I))
     return html.unescape(m.group(1)) if m else None
+
+
+def page_media(link: str, want_video: bool):
+    """از صفحهٔ خود خبر عکس (og:image) و در صورت نیاز لینک ویدیو را پیدا می‌کند."""
+    try:
+        page = http_get(link, timeout=12, limit=800_000).decode("utf-8", "ignore")
+    except Exception:
+        return None, None
+    image = _meta(page, "og:image")
+    video = None
+    for prop in ("og:video:secure_url", "og:video:url", "og:video", "twitter:player:stream"):
+        v = _meta(page, prop)
+        if v and v.lower().split("?")[0].endswith((".mp4", ".m4v", ".mov")):
+            video = v
+            break
+    if not video and want_video:
+        txt = page.replace("\\/", "/")
+        m = (re.search(r'<(?:video|source)[^>]+src=["\']([^"\']+\.mp4[^"\']*)', txt, re.I)
+             or re.search(r'["\'(=]((?:https?:)?//[^"\'\s<>()]+\.mp4(?:\?[^"\'\s<>()]*)?)', txt, re.I))
+        if m:
+            video = html.unescape(m.group(1))
+    if video:
+        video = urllib.parse.urljoin(link, video)
+    return image, video
+
+
+def og_image(link: str):
+    return page_media(link, False)[0]
 
 
 def build_post(it: dict, title: str, summary: str, limit: int) -> str:
@@ -204,6 +311,12 @@ def send_post(it: dict, title: str, summary: str):
     """اولویت: ویدیو، بعد عکس، بعد متن ساده."""
     caption = build_post(it, title, summary, 1000)
     base = {"chat_id": CHANNEL, "caption": caption, "parse_mode": "HTML"}
+    page_img = None
+    if not it.get("video"):
+        looks_video = bool(re.search(r"ویدیو|ویدئو|فیلم|video|watch|highlights|clip", it["title"], re.I))
+        page_img, found = page_media(it["link"], looks_video)
+        if found:
+            it["video"] = found
     if it.get("video"):
         try:
             tg("sendVideo", {**base, "video": it["video"], "supports_streaming": "true"})
@@ -218,6 +331,15 @@ def send_post(it: dict, title: str, summary: str):
                 return "video"
         except Exception as e:
             print("  ارسال ویدیو نشد:", type(e).__name__)
+    imgs = [upgrade_image(u) for u in it.get("images", [])]
+    if len(imgs) >= 2:  # چند عکس: آلبوم
+        media = [{"type": "photo", "media": u} for u in imgs]
+        media[0].update({"caption": caption, "parse_mode": "HTML"})
+        try:
+            tg("sendMediaGroup", {"chat_id": CHANNEL, "media": json.dumps(media)})
+            return "album"
+        except TgError as e:
+            print("  ارسال آلبوم نشد، یک عکس می‌فرستیم:", e)
     candidates = [upgrade_image(it["image"])] if it.get("image") else []
     tried_og = False
     while True:
@@ -225,7 +347,7 @@ def send_post(it: dict, title: str, summary: str):
             if tried_og:
                 break
             tried_og = True
-            extra = og_image(it["link"])
+            extra = page_img or og_image(it["link"])
             if extra:
                 candidates.append(extra)
             continue
@@ -286,11 +408,7 @@ def main():
         if posted >= MAX_PER_RUN:
             break
         try:
-            title = to_persian(it["title"])
-            try:
-                summary = to_persian(it["summary"][:500]) if not it["summary"].startswith(it["title"][:40]) else ""
-            except TranslateError:
-                summary = ""
+            title, summary = translate_item(it)
         except TranslateError as e:
             print("ترجمه نشد، دفعهٔ بعد دوباره:", e)
             break
