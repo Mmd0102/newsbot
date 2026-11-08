@@ -1,0 +1,13 @@
+# هر خط یک فید: نام منبع | آدرس RSS | ایموجی
+# خطی که با # شروع شود نادیده گرفته می‌شود. هر وقت خواستید فید اضافه یا کم کنید همین فایل را در گیت‌هاب ویرایش کنید.
+# بعد از هر تغییر، از تب Actions گزینهٔ «بررسی فیدها» را اجرا کنید تا ببینید کدام فیدها کار می‌کنند.
+
+# ── منابع ایرانی (آدرس‌ها را من نتوانستم از اینجا بررسی کنم؛ ممکن است عوض شده باشند یا IP خارجی را مسدود کنند) ──
+ورزش ۳ | https://www.varzesh3.com/rss/all | ⚽
+خبرورزشی | https://www.khabarvarzeshi.com/rss | ⚽
+
+# ── منابع خارجی (آدرس‌ها بررسی شده‌اند؛ خبر به فارسی ترجمه می‌شود) ──
+BBC Sport | https://feeds.bbci.co.uk/sport/football/rss.xml | ⚽
+BBC Sport | https://feeds.bbci.co.uk/sport/rss.xml | 🏆
+The Guardian | https://www.theguardian.com/football/rss | ⚽
+Sky Sports | https://www.skysports.com/rss/12040 | 🏆
