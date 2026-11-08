@@ -325,7 +325,7 @@ def aparat_hashes(page: str) -> list:
     return list(dict.fromkeys(hs))
 
 
-def aparat_sources(h: str) -> list:
+def aparat_sources(h: str, ref: str = "https://www.khabarvarzeshi.com/", dbg: bool = False) -> list:
     """لینک‌های فایل ویدیوی آپارات (mp4 با کیفیت بالا به پایین؛ بعد HLS)."""
     cands = []  # (اولویت، ارتفاع، لینک)
 
@@ -349,15 +349,26 @@ def aparat_sources(h: str) -> list:
         elif isinstance(o, str):
             add(o, height)
 
-    try:
-        walk(json.loads(_fetch(f"https://www.aparat.com/etc/api/video/videohash/{h}", "https://www.aparat.com/")))
-    except Exception as e:
-        print("  API آپارات جواب نداد:", type(e).__name__, getattr(e, "code", ""))
+    for api in (f"https://www.aparat.com/api/fa/v1/video/video/show/videohash/{h}",
+                f"https://www.aparat.com/etc/api/video/videohash/{h}"):
+        try:
+            raw = _fetch(api, ref)
+            if dbg:
+                print("   API:", api.split("aparat.com")[1][:50], "←", raw[:300].replace("\n", " "))
+            walk(json.loads(raw))
+        except Exception as e:
+            print("  API آپارات جواب نداد:", api.split("aparat.com")[1][:40], type(e).__name__, getattr(e, "code", ""))
+        if cands:
+            break
     if not cands:  # صفحهٔ پخش‌کننده
         try:
-            frame = _fetch(f"https://www.aparat.com/video/video/embed/videohash/{h}/vt/frame", "https://www.aparat.com/")
-            for m in re.finditer(r'(?:src|file|url)["\']?\s*[:=]\s*["\']([^"\']+?' + VIDEO_EXT + r'[^"\']*)',
-                                 html.unescape(frame.replace("\\/", "/")), re.I):
+            frame = _fetch(f"https://www.aparat.com/video/video/embed/videohash/{h}/vt/frame", ref)
+            txt = html.unescape(frame.replace("\\/", "/"))
+            if dbg:
+                print(f"   frame: {len(frame)} نویسه؛ شروع:", re.sub(r"\s+", " ", frame[:200]))
+                for m in list(re.finditer(r"m3u8|\.mp4|multiSRC|file_link", txt))[:4]:
+                    print("   frame سرنخ:", re.sub(r"\s+", " ", txt[max(0, m.start() - 80):m.end() + 120]))
+            for m in re.finditer(r'(?:src|file|url|hls)["\']?\s*[:=]\s*["\']([^"\']+?' + VIDEO_EXT + r'[^"\']*)', txt, re.I):
                 add(m.group(1))
         except Exception as e:
             print("  صفحهٔ پخش آپارات باز نشد:", type(e).__name__, getattr(e, "code", ""))
@@ -376,7 +387,7 @@ def page_media(link: str, want_video: bool):
     videos = find_videos(page, link) if want_video else []
     if want_video and not videos:
         for h in aparat_hashes(page):
-            videos += aparat_sources(h)
+            videos += aparat_sources(h, link)
             if videos:
                 break
         if videos:
@@ -394,7 +405,7 @@ def debug_page(link: str):
     print(f"   صفحه باز شد ({len(page)} نویسه)، تگ video: {len(re.findall(r'<video', page, re.I))}")
     print("   ویدیوهای پیدا‌شده:", find_videos(page, link)[:3] or "هیچ")
     for h in aparat_hashes(page)[:1]:
-        print("   آپارات:", h, "←", aparat_sources(h)[:3] or "فایلی پیدا نشد")
+        print("   آپارات:", h, "←", aparat_sources(h, link, dbg=True)[:3] or "فایلی پیدا نشد")
     hints = re.findall(r'(?:https?:)?//[^"\'\s<>()\\]+(?:video|player|aparat|embed|stream|media)[^"\'\s<>()\\]*', page, re.I)
     for h in list(dict.fromkeys(hints))[:8]:
         print("   سرنخ:", h[:140])
