@@ -444,6 +444,29 @@ def build_post(it: dict, title: str, summary: str, limit: int) -> str:
 
 
 # ───────────── ارسال ─────────────
+_FFMPEG = None
+
+
+def get_ffmpeg() -> str:
+    """مسیر ffmpeg؛ اگر روی سیستم نبود، همان لحظه از pip (بستهٔ imageio-ffmpeg) نصب می‌شود."""
+    global _FFMPEG
+    if _FFMPEG:
+        return _FFMPEG
+    import shutil, subprocess
+    path = shutil.which("ffmpeg")
+    if not path:
+        try:
+            import imageio_ffmpeg
+        except ImportError:
+            print("  ffmpeg نبود؛ نصب از pip ...")
+            subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "imageio-ffmpeg"],
+                           check=True, timeout=240)
+            import imageio_ffmpeg
+        path = imageio_ffmpeg.get_ffmpeg_exe()
+    _FFMPEG = path
+    return path
+
+
 def hls_variants(url: str, referer: str) -> list:
     """کیفیت‌های یک فهرست HLS به ترتیب ظاهر شدن: [(ارتفاع، پهنای‌باند), ...]"""
     try:
@@ -470,7 +493,7 @@ def ffmpeg_fetch(url: str, referer: str):
     hdr = f"Referer: {referer}\r\nUser-Agent: {BROWSER_UA['User-Agent']}\r\n"
     for idx in attempts:
         out = os.path.join(tempfile.mkdtemp(), "v.mp4")
-        base = ["ffmpeg", "-y", "-loglevel", "error", "-headers", hdr, "-i", url]
+        base = [get_ffmpeg(), "-y", "-loglevel", "error", "-headers", hdr, "-i", url]
         tail = ["-c", "copy", "-bsf:a", "aac_adtstoasc", "-movflags", "+faststart",
                 "-fs", str(VIDEO_LIMIT + 1048576), "-t", "900", out]
         cmds = [base + ["-map", f"0:p:{idx}"] + tail, base + tail] if idx is not None else [base + tail]
