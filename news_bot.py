@@ -301,6 +301,71 @@ def find_videos(page: str, link: str) -> list:
     return out
 
 
+def _fetch(url: str, referer: str = None, limit: int = 1_500_000) -> str:
+    req = urllib.request.Request(url, headers={**BROWSER_UA, **({"Referer": referer} if referer else {})})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return r.read(limit).decode("utf-8", "ignore")
+
+
+def head_size(url: str, referer: str):
+    """حجم فایل از روی هدر (اگر معلوم باشد)، وگرنه None."""
+    try:
+        req = urllib.request.Request(url, method="HEAD",
+                                     headers={**BROWSER_UA, "Referer": referer})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            n = r.headers.get("Content-Length")
+            return int(n) if n else None
+    except Exception:
+        return None
+
+
+def aparat_hashes(page: str) -> list:
+    hs = re.findall(r"aparat\.com/video/video/embed/videohash/([A-Za-z0-9]+)", page)
+    hs += re.findall(r"aparat\.com/v/([A-Za-z0-9]+)", page)
+    return list(dict.fromkeys(hs))
+
+
+def aparat_sources(h: str) -> list:
+    """لینک‌های فایل ویدیوی آپارات (mp4 با کیفیت بالا به پایین؛ بعد HLS)."""
+    cands = []  # (اولویت، ارتفاع، لینک)
+
+    def add(u, height=0):
+        u = u.replace("\\/", "/")
+        if u.startswith("//"):
+            u = "https:" + u
+        if u.startswith("http") and re.search(VIDEO_EXT, u, re.I) and all(u != c[2] for c in cands):
+            cands.append((0 if ".mp4" in u.lower() else 1, height, u))
+
+    def walk(o, height=0):
+        if isinstance(o, dict):
+            p = str(o.get("profile", o.get("quality", o.get("label", ""))))
+            m = re.match(r"(\d{3,4})", p)
+            hh = int(m.group(1)) if m else height
+            for v in o.values():
+                walk(v, hh)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v, height)
+        elif isinstance(o, str):
+            add(o, height)
+
+    try:
+        walk(json.loads(_fetch(f"https://www.aparat.com/etc/api/video/videohash/{h}", "https://www.aparat.com/")))
+    except Exception as e:
+        print("  API آپارات جواب نداد:", type(e).__name__, getattr(e, "code", ""))
+    if not cands:  # صفحهٔ پخش‌کننده
+        try:
+            frame = _fetch(f"https://www.aparat.com/video/video/embed/videohash/{h}/vt/frame", "https://www.aparat.com/")
+            for m in re.finditer(r'(?:src|file|url)["\']?\s*[:=]\s*["\']([^"\']+?' + VIDEO_EXT + r'[^"\']*)',
+                                 html.unescape(frame.replace("\\/", "/")), re.I):
+                add(m.group(1))
+        except Exception as e:
+            print("  صفحهٔ پخش آپارات باز نشد:", type(e).__name__, getattr(e, "code", ""))
+    ok = [c for c in cands if c[1] == 0 or c[1] <= 720]
+    ok.sort(key=lambda c: (c[0], -c[1]))
+    return [c[2] for c in ok]
+
+
 def page_media(link: str, want_video: bool):
     """از صفحهٔ خبر: عکس (og:image) و فهرست لینک‌های ویدیو."""
     try:
@@ -309,6 +374,13 @@ def page_media(link: str, want_video: bool):
         print("  صفحهٔ خبر باز نشد:", type(e).__name__, getattr(e, "code", ""))
         return None, []
     videos = find_videos(page, link) if want_video else []
+    if want_video and not videos:
+        for h in aparat_hashes(page):
+            videos += aparat_sources(h)
+            if videos:
+                break
+        if videos:
+            print(f"  ویدیوی آپارات پیدا شد ({len(videos)} فایل)")
     return _meta(page, "og:image"), videos
 
 
@@ -321,6 +393,8 @@ def debug_page(link: str):
         return
     print(f"   صفحه باز شد ({len(page)} نویسه)، تگ video: {len(re.findall(r'<video', page, re.I))}")
     print("   ویدیوهای پیدا‌شده:", find_videos(page, link)[:3] or "هیچ")
+    for h in aparat_hashes(page)[:1]:
+        print("   آپارات:", h, "←", aparat_sources(h)[:3] or "فایلی پیدا نشد")
     hints = re.findall(r'(?:https?:)?//[^"\'\s<>()\\]+(?:video|player|aparat|embed|stream|media)[^"\'\s<>()\\]*', page, re.I)
     for h in list(dict.fromkeys(hints))[:8]:
         print("   سرنخ:", h[:140])
@@ -372,16 +446,22 @@ def send_post(it: dict, title: str, summary: str):
         page_img, videos = page_media(it["link"], looks_video)
         if looks_video and not videos:
             print("  🔍 ویدیو در صفحهٔ خبر پیدا نشد (برای بررسی، اجرای «test» را بزنید)")
-    for v in videos[:3]:
+    for v in videos[:6]:
         is_hls = ".m3u8" in v.lower()
+        ref = "https://www.aparat.com/" if "aparat" in v.lower() else it["link"]
         if not is_hls:
+            size = head_size(v, ref)
+            if size and size > VIDEO_LIMIT:
+                print(f"  ویدیو {size // 1048576}MB بزرگ است؛ کیفیت پایین‌تر امتحان می‌شود")
+                continue
+        if not is_hls and "aparat" not in v.lower():
             try:
                 tg("sendVideo", {**base, "video": v, "supports_streaming": "true"})
                 return "video"
             except TgError:
                 pass
         try:  # تلگرام نتوانست از لینک بگیرد؛ خودمان دانلود و آپلود می‌کنیم
-            data = ffmpeg_fetch(v, it["link"]) if is_hls else download(v, VIDEO_LIMIT, it["link"])
+            data = ffmpeg_fetch(v, ref) if is_hls else download(v, VIDEO_LIMIT, ref)
             if data:
                 tg("sendVideo", {**base, "supports_streaming": "true"},
                    files={"video": ("video.mp4", data, "video/mp4")}, timeout=300)
