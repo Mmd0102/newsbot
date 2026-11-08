@@ -383,16 +383,18 @@ def page_media(link: str, want_video: bool):
         page = fetch_page(link)
     except Exception as e:
         print("  صفحهٔ خبر باز نشد:", type(e).__name__, getattr(e, "code", ""))
-        return None, []
+        return None, [], None
     videos = find_videos(page, link) if want_video else []
+    hashes = aparat_hashes(page) if want_video else []
+    watch = f"https://www.aparat.com/v/{hashes[0]}" if hashes else None  # لینک تماشا (برای ویدیوی حجیم)
     if want_video and not videos:
-        for h in aparat_hashes(page):
+        for h in hashes:
             videos += aparat_sources(h, link)
             if videos:
                 break
         if videos:
             print(f"  ویدیوی آپارات پیدا شد ({len(videos)} فایل)")
-    return _meta(page, "og:image"), videos
+    return _meta(page, "og:image"), videos, watch
 
 
 def debug_page(link: str, trial: bool = False):
@@ -429,17 +431,18 @@ def og_image(link: str):
     return page_media(link, False)[0]
 
 
-def build_post(it: dict, title: str, summary: str, limit: int) -> str:
+def build_post(it: dict, title: str, summary: str, limit: int, watch: str = None) -> str:
     """شکل پست (بین هر بخش دو Enter یعنی یک خط خالی):
-    عنوان / خلاصه / [نام منبع] / امضای کانال"""
+    عنوان / خلاصه / [لینک تماشای ویدیو، اگر ویدیو فرستاده نشده] / [نام منبع] / امضای کانال"""
     head = f"{it['emoji']} <b>{html.escape(title)}</b>"
     source = f"[{html.escape(it['source'])}]"
     foot = source + "\n\n" + html.escape(SIGNATURE)
-    budget = limit - len(head) - len(foot) - 10
+    watch_line = f"🎬 مشاهدهٔ ویدیو: {watch}" if watch else ""
+    budget = limit - len(head) - len(foot) - len(watch_line) - 10
     body = summary
     if len(body) > budget:
         body = body[:max(budget, 0)].rsplit(" ", 1)[0] + "…" if budget > 40 else ""
-    parts = [head] + ([html.escape(body)] if body else []) + [foot]
+    parts = [head] + ([html.escape(body)] if body else []) + ([watch_line] if watch_line else []) + [foot]
     return "\n\n".join(parts)
 
 
@@ -523,11 +526,11 @@ def send_post(it: dict, title: str, summary: str):
     """اولویت: ویدیو، بعد عکس‌ها، بعد متن ساده."""
     caption = build_post(it, title, summary, 1000)
     base = {"chat_id": CHANNEL, "caption": caption, "parse_mode": "HTML"}
-    page_img = None
+    page_img, watch = None, None
     videos = [it["video"]] if it.get("video") else []
     if not videos:
         looks_video = bool(re.search(r"ویدیو|ویدئو|فیلم|video|watch|highlights|clip", it["title"], re.I))
-        page_img, videos = page_media(it["link"], looks_video)
+        page_img, videos, watch = page_media(it["link"], looks_video)
         if looks_video and not videos:
             print("  🔍 ویدیو در صفحهٔ خبر پیدا نشد (برای بررسی، اجرای «test» را بزنید)")
     for v in videos[:6]:
@@ -553,6 +556,9 @@ def send_post(it: dict, title: str, summary: str):
             print("  ویدیو بزرگ‌تر از ۴۸ مگابایت است:", v[:100])
         except Exception as e:
             print("  ارسال ویدیو نشد:", type(e).__name__, getattr(e, "code", ""), v[:100])
+    if watch:  # ویدیو فرستاده نشد (مثلاً حجم زیاد): لینک تماشا را زیر خبر می‌گذاریم
+        caption = build_post(it, title, summary, 1000, watch)
+        base["caption"] = caption
     imgs = [upgrade_image(u) for u in it.get("images", [])]
     if len(imgs) >= 2:  # چند عکس: آلبوم
         media = [{"type": "photo", "media": u} for u in imgs]
@@ -578,7 +584,7 @@ def send_post(it: dict, title: str, summary: str):
             return "photo"
         except TgError as e:
             print("  ارسال عکس نشد:", e)
-    tg("sendMessage", {"chat_id": CHANNEL, "text": build_post(it, title, summary, 4000),
+    tg("sendMessage", {"chat_id": CHANNEL, "text": build_post(it, title, summary, 4000, watch),
                        "parse_mode": "HTML", "disable_web_page_preview": "true"})
     return "text"
 
