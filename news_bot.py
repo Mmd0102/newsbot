@@ -174,6 +174,16 @@ def pick_images(main, urls, limit: int = 5):
     return out[:limit]
 
 
+# خبرهایی که فقط یک «لینک پخش زنده/تماشا» هستند: لینک خود خبر هم زیر پست گذاشته می‌شود
+SKIP_RE = re.compile(
+    r"پخش\s*(?:زنده|مستقیم|آنلاین)|لینک\s*(?:پخش|تماشا|مشاهده)|تماشای\s*(?:زنده|آنلاین|مستقیم)"
+    r"|در\s*همین\s*صفحه|ساعت\s*پخش|ساعت\s*بازی\s*و\s*پخش"
+    r"|\blive\b|live\s*(?:blog|stream|text)|how\s+to\s+watch|where\s+to\s+watch|tv\s+channel|kick-?off\s+time",
+    re.I)
+if os.environ.get("SKIP_EXTRA"):  # کلمه‌های بیشتر برای رد کردن، با | جدا شوند
+    SKIP_RE = re.compile(SKIP_RE.pattern + "|" + os.environ["SKIP_EXTRA"], re.I)
+
+
 def load_feeds():
     feeds = []
     with open(FEEDS_FILE, encoding="utf-8") as f:
@@ -432,17 +442,19 @@ def og_image(link: str):
 
 
 def build_post(it: dict, title: str, summary: str, limit: int, watch: str = None) -> str:
+    live_line = (f'📺 <a href="{html.escape(it["link"], quote=True)}">لینک مشاهده</a>'
+                 if it.get("need_link") else "")
     """شکل پست (بین هر بخش دو Enter یعنی یک خط خالی):
     عنوان / خلاصه / [لینک تماشای ویدیو، اگر ویدیو فرستاده نشده] / [نام منبع] / امضای کانال"""
     head = f"{it['emoji']} <b>{html.escape(title)}</b>"
     source = f"[{html.escape(it['source'])}]"
     foot = source + "\n\n" + html.escape(SIGNATURE)
     watch_line = f"🎬 مشاهدهٔ ویدیو: {watch}" if watch else ""
-    budget = limit - len(head) - len(foot) - len(watch_line) - 10
+    budget = limit - len(head) - len(foot) - len(watch_line) - len(live_line) - 10
     body = summary
     if len(body) > budget:
         body = body[:max(budget, 0)].rsplit(" ", 1)[0] + "…" if budget > 40 else ""
-    parts = [head] + ([html.escape(body)] if body else []) + ([watch_line] if watch_line else []) + [foot]
+    parts = [head] + ([html.escape(body)] if body else []) + ([watch_line] if watch_line else []) + ([live_line] if live_line else []) + [foot]
     return "\n\n".join(parts)
 
 
@@ -638,6 +650,7 @@ def main():
         if warmup:
             seen.append(h); seen_set.add(h)
             continue
+        it["need_link"] = bool(SKIP_RE.search(it["title"] + " " + it["summary"][:400]))
         if posted >= MAX_PER_RUN:
             break
         try:
