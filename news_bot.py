@@ -19,7 +19,9 @@ VIDEO_LIMIT = 48 * 1024 * 1024  # سقف آپلود ربات‌ها ~۵۰ مگا
 
 
 class TgError(Exception):
-    pass
+    def __init__(self, msg="", maybe_sent=False):
+        super().__init__(msg)
+        self.maybe_sent = maybe_sent  # خطای شبکه/زمان‌بر: ممکن است تلگرام پست را گرفته باشد
 
 
 class TranslateError(Exception):
@@ -75,11 +77,11 @@ def tg(method: str, params: dict, files: dict = None, timeout: int = 60):
         try:
             res = json.loads(e.read().decode())
         except Exception:
-            res = {"ok": False, "description": f"HTTP {e.code}"}
+            res = {"ok": False, "description": f"HTTP {e.code}", "_net": True}
     except Exception as e:
-        raise TgError(type(e).__name__)  # آدرس (که توکن دارد) در پیام خطا نیاید
+        raise TgError(type(e).__name__, maybe_sent=True)  # آدرس (که توکن دارد) در پیام خطا نیاید
     if not res.get("ok"):
-        raise TgError(res.get("description", "unknown"))
+        raise TgError(res.get("description", "unknown"), maybe_sent=bool(res.get("_net")))
     return res
 
 
@@ -177,7 +179,7 @@ def pick_images(main, urls, limit: int = 5):
 # خبرهایی که فقط یک «لینک پخش زنده/تماشا» هستند: لینک خود خبر هم زیر پست گذاشته می‌شود
 SKIP_RE = re.compile(
     r"پخش\s*(?:زنده|مستقیم|آنلاین)|لینک\s*(?:پخش|تماشا|مشاهده)|تماشای\s*(?:زنده|آنلاین|مستقیم)"
-    r"|در\s*همین\s*صفحه|ساعت\s*پخش|ساعت\s*بازی\s*و\s*پخش"
+    r"|تماشا\s*کنید|در\s*همین\s*صفحه|ساعت\s*پخش|ساعت\s*بازی\s*و\s*پخش"
     r"|\blive\b|live\s*(?:blog|stream|text)|how\s+to\s+watch|where\s+to\s+watch|tv\s+channel|kick-?off\s+time",
     re.I)
 if os.environ.get("SKIP_EXTRA"):  # کلمه‌های بیشتر برای رد کردن، با | جدا شوند
@@ -557,8 +559,10 @@ def send_post(it: dict, title: str, summary: str):
             try:
                 tg("sendVideo", {**base, "video": v, "supports_streaming": "true"})
                 return "video"
-            except TgError:
-                pass
+            except TgError as e:
+                if e.maybe_sent:
+                    return "video?"
+
         try:  # تلگرام نتوانست از لینک بگیرد؛ خودمان دانلود و آپلود می‌کنیم
             data = ffmpeg_fetch(v, ref) if is_hls else download(v, VIDEO_LIMIT, ref)
             if data:
@@ -566,6 +570,10 @@ def send_post(it: dict, title: str, summary: str):
                    files={"video": ("video.mp4", data, "video/mp4")}, timeout=300)
                 return "video"
             print("  ویدیو بزرگ‌تر از ۴۸ مگابایت است:", v[:100])
+        except TgError as e:
+            print("  ارسال ویدیو نشد:", e)
+            if e.maybe_sent:  # شاید رفته باشد؛ دوباره نمی‌فرستیم
+                return "video?"
         except Exception as e:
             print("  ارسال ویدیو نشد:", type(e).__name__, getattr(e, "code", ""), v[:100])
     if watch:  # ویدیو فرستاده نشد (مثلاً حجم زیاد): لینک تماشا را زیر خبر می‌گذاریم
@@ -580,6 +588,8 @@ def send_post(it: dict, title: str, summary: str):
             return "album"
         except TgError as e:
             print("  ارسال آلبوم نشد، یک عکس می‌فرستیم:", e)
+            if e.maybe_sent:
+                return "album?"
     candidates = [upgrade_image(it["image"])] if it.get("image") else []
     tried_og = False
     while True:
@@ -596,6 +606,8 @@ def send_post(it: dict, title: str, summary: str):
             return "photo"
         except TgError as e:
             print("  ارسال عکس نشد:", e)
+            if e.maybe_sent:
+                return "photo?"
     tg("sendMessage", {"chat_id": CHANNEL, "text": build_post(it, title, summary, 4000, watch),
                        "parse_mode": "HTML", "disable_web_page_preview": "true"})
     return "text"
@@ -613,6 +625,12 @@ def load_state():
 def save_state(seen: list):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(seen[-3000:], f)
+
+
+def title_key(title: str) -> str:
+    """کلید یکتا از عنوان (برای خبر تکراری با آدرس متفاوت)."""
+    t = re.sub(r"[^\w]+", "", title.lower())
+    return "t" + hashlib.sha1(t.encode()).hexdigest()[:12]
 
 
 def main():
@@ -645,10 +663,11 @@ def main():
         if it["ts"] < cutoff:
             continue
         h = hashlib.sha1(it["link"].encode()).hexdigest()[:16]
-        if h in seen_set:
+        tk = title_key(it["title"])
+        if h in seen_set or tk in seen_set:
             continue
         if warmup:
-            seen.append(h); seen_set.add(h)
+            seen += [h, tk]; seen_set.update((h, tk))
             continue
         it["need_link"] = bool(SKIP_RE.search(it["title"] + " " + it["summary"][:400]))
         if posted >= MAX_PER_RUN:
@@ -658,13 +677,18 @@ def main():
         except TranslateError as e:
             print("ترجمه نشد، دفعهٔ بعد دوباره:", e)
             break
+        # قبل از ارسال علامت می‌زنیم تا هیچ‌وقت یک خبر دوبار نرود (حتی اگر اجرا وسط کار خراب شود)
+        seen += [h, tk]; seen_set.update((h, tk))
+        save_state(seen)
         try:
             kind = send_post(it, title, summary)
         except TgError as e:
             print("❌ ارسال نشد:", e, "— ربات باید در کانال ادمین با دسترسی ارسال پیام باشد.")
+            if not e.maybe_sent:  # خطای قطعی: دفعهٔ بعد دوباره امتحان شود
+                seen[:] = [x for x in seen if x not in (h, tk)]; seen_set.difference_update((h, tk))
+                save_state(seen)
             break
         print(f"📤 {kind}: {it['title'][:60]}")
-        seen.append(h); seen_set.add(h)
         posted += 1
         time.sleep(3)
     save_state(seen)
