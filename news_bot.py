@@ -395,7 +395,7 @@ def page_media(link: str, want_video: bool):
     return _meta(page, "og:image"), videos
 
 
-def debug_page(link: str):
+def debug_page(link: str, trial: bool = False):
     """برای عیب‌یابی: نشان می‌دهد در صفحهٔ خبر چه چیزهایی دربارهٔ ویدیو هست."""
     try:
         page = fetch_page(link)
@@ -405,7 +405,19 @@ def debug_page(link: str):
     print(f"   صفحه باز شد ({len(page)} نویسه)، تگ video: {len(re.findall(r'<video', page, re.I))}")
     print("   ویدیوهای پیدا‌شده:", find_videos(page, link)[:3] or "هیچ")
     for h in aparat_hashes(page)[:1]:
-        print("   آپارات:", h, "←", aparat_sources(h, link, dbg=True)[:3] or "فایلی پیدا نشد")
+        srcs = aparat_sources(h, link, dbg=True)
+        print("   آپارات:", h, "←", [u[:90] for u in srcs[:3]] or "فایلی پیدا نشد")
+        if srcs and ".m3u8" in srcs[0]:
+            print("   کیفیت‌های HLS:", hls_variants(srcs[0], "https://www.aparat.com/") or "نامشخص")
+        if trial and srcs:
+            t0 = time.time()
+            try:
+                data = ffmpeg_fetch(srcs[0], "https://www.aparat.com/") if ".m3u8" in srcs[0] \
+                    else download(srcs[0], VIDEO_LIMIT, "https://www.aparat.com/")
+                print(f"   🧪 آزمایش دانلود: {'موفق، %d مگابایت' % (len(data) // 1048576) if data else 'بزرگ‌تر از ۴۸ مگابایت'}"
+                      f" ({time.time() - t0:.0f} ثانیه)")
+            except Exception as e:
+                print("   🧪 آزمایش دانلود ناموفق:", type(e).__name__, getattr(e, "code", ""))
     hints = re.findall(r'(?:https?:)?//[^"\'\s<>()\\]+(?:video|player|aparat|embed|stream|media)[^"\'\s<>()\\]*', page, re.I)
     for h in list(dict.fromkeys(hints))[:8]:
         print("   سرنخ:", h[:140])
@@ -432,18 +444,56 @@ def build_post(it: dict, title: str, summary: str, limit: int) -> str:
 
 
 # ───────────── ارسال ─────────────
+def hls_variants(url: str, referer: str) -> list:
+    """کیفیت‌های یک فهرست HLS به ترتیب ظاهر شدن: [(ارتفاع، پهنای‌باند), ...]"""
+    try:
+        text = _fetch(url, referer, 300_000)
+    except Exception:
+        return []
+    out = []
+    for line in text.splitlines():
+        if line.startswith("#EXT-X-STREAM-INF"):
+            r = re.search(r"RESOLUTION=\d+x(\d+)", line)
+            bw = re.search(r"BANDWIDTH=(\d+)", line)
+            out.append((int(r.group(1)) if r else 0, int(bw.group(1)) if bw else 0))
+    return out
+
+
 def ffmpeg_fetch(url: str, referer: str):
-    """ویدیوی HLS (m3u8) را با ffmpeg به mp4 تبدیل می‌کند؛ اگر بزرگ بود None."""
+    """ویدیوی HLS (m3u8) را با ffmpeg به mp4 تبدیل می‌کند. از کیفیت بالا شروع می‌کند
+    و اگر از ۴۸ مگابایت بزرگ‌تر شد، کیفیت پایین‌تر را امتحان می‌کند. اگر نشد None."""
     import subprocess, tempfile
-    out = os.path.join(tempfile.mkdtemp(), "v.mp4")
+    variants = hls_variants(url, referer)
+    idxs = sorted(range(len(variants)), key=lambda i: -variants[i][0])
+    idxs = [i for i in idxs if 0 < variants[i][0] <= 720] or idxs
+    attempts = idxs[:3] or [None]
     hdr = f"Referer: {referer}\r\nUser-Agent: {BROWSER_UA['User-Agent']}\r\n"
-    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-headers", hdr, "-i", url, "-t", "900",
-                    "-c", "copy", "-bsf:a", "aac_adtstoasc", "-movflags", "+faststart", out],
-                   check=True, timeout=300)
-    if os.path.getsize(out) > VIDEO_LIMIT:
-        return None
-    with open(out, "rb") as f:
-        return f.read()
+    for idx in attempts:
+        out = os.path.join(tempfile.mkdtemp(), "v.mp4")
+        base = ["ffmpeg", "-y", "-loglevel", "error", "-headers", hdr, "-i", url]
+        tail = ["-c", "copy", "-bsf:a", "aac_adtstoasc", "-movflags", "+faststart",
+                "-fs", str(VIDEO_LIMIT + 1048576), "-t", "900", out]
+        cmds = [base + ["-map", f"0:p:{idx}"] + tail, base + tail] if idx is not None else [base + tail]
+        ok = False
+        for cmd in cmds:
+            try:
+                subprocess.run(cmd, check=True, timeout=300, capture_output=True)
+                ok = os.path.exists(out) and os.path.getsize(out) > 0
+            except subprocess.CalledProcessError as e:
+                print("  ffmpeg خطا:", (e.stderr or b"")[-200:].decode("utf-8", "ignore").strip())
+            if ok:
+                break
+        if not ok:
+            continue
+        size = os.path.getsize(out)
+        label = f"{variants[idx][0]}p" if idx is not None and variants else "?"
+        if size > VIDEO_LIMIT:
+            print(f"  کیفیت {label} بزرگ‌تر از ۴۸ مگابایت شد؛ پایین‌تر امتحان می‌شود")
+            continue
+        print(f"  ویدیو آماده شد: {label}، {size // 1048576} مگابایت")
+        with open(out, "rb") as f:
+            return f.read()
+    return None
 
 
 def send_post(it: dict, title: str, summary: str):
@@ -539,9 +589,9 @@ def main():
         print(f"مجموع: {len(items)} خبر. (حالت آزمایشی؛ چیزی ارسال نشد)")
         vids = [i for i in sorted(items, key=lambda i: i["ts"], reverse=True)
                 if re.search(r"ویدیو|ویدئو|فیلم|video", i["title"], re.I)][:3]
-        for i in vids:
+        for n, i in enumerate(vids):
             print(f"\n🎬 بررسی ویدیو: {i['title'][:60]}\n   {i['link']}\n   ویدیو در فید: {i['video']}")
-            debug_page(i["link"])
+            debug_page(i["link"], trial=(n == 0))
         return
     items.sort(key=lambda i: i["ts"], reverse=True)
     state = load_state()
