@@ -33,9 +33,14 @@ def http_get(url: str, timeout: int = 20, limit: int = None) -> bytes:
         return r.read(limit) if limit else r.read()
 
 
-def download(url: str, limit: int):
+BROWSER_UA = {"User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
+                            "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36",
+              "Accept-Language": "fa,en;q=0.8"}
+
+
+def download(url: str, limit: int, referer: str = None):
     """فایل را تا سقف مشخص دانلود می‌کند؛ اگر بزرگ‌تر بود None."""
-    req = urllib.request.Request(url, headers=UA)
+    req = urllib.request.Request(url, headers={**BROWSER_UA, **({"Referer": referer} if referer else {})})
     data = bytearray()
     with urllib.request.urlopen(req, timeout=60) as r:
         while True:
@@ -264,28 +269,63 @@ def _meta(page: str, prop: str):
     return html.unescape(m.group(1)) if m else None
 
 
-def page_media(link: str, want_video: bool):
-    """از صفحهٔ خود خبر عکس (og:image) و در صورت نیاز لینک ویدیو را پیدا می‌کند."""
-    try:
-        page = http_get(link, timeout=12, limit=800_000).decode("utf-8", "ignore")
-    except Exception:
-        return None, None
-    image = _meta(page, "og:image")
-    video = None
+def fetch_page(link: str) -> str:
+    req = urllib.request.Request(link, headers=BROWSER_UA)
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return r.read(1_500_000).decode("utf-8", "ignore")
+
+
+VIDEO_EXT = r"\.(?:mp4|m3u8|webm)"
+
+
+def find_videos(page: str, link: str) -> list:
+    """همهٔ لینک‌های ویدیوی داخل صفحهٔ خبر (mp4 اول، بعد webm، بعد m3u8)."""
+    txt = html.unescape(page.replace("\\/", "/").replace("\\u002F", "/").replace("\\u0026", "&"))
+    found = []
     for prop in ("og:video:secure_url", "og:video:url", "og:video", "twitter:player:stream"):
-        v = _meta(page, prop)
-        if v and v.lower().split("?")[0].endswith((".mp4", ".m4v", ".mov")):
-            video = v
-            break
-    if not video and want_video:
-        txt = page.replace("\\/", "/")
-        m = (re.search(r'<(?:video|source)[^>]+src=["\']([^"\']+\.mp4[^"\']*)', txt, re.I)
-             or re.search(r'["\'(=]((?:https?:)?//[^"\'\s<>()]+\.mp4(?:\?[^"\'\s<>()]*)?)', txt, re.I))
-        if m:
-            video = html.unescape(m.group(1))
-    if video:
-        video = urllib.parse.urljoin(link, video)
-    return image, video
+        v = _meta(txt, prop)
+        if v:
+            found.append(v)
+    for m in re.finditer(r'<(?:video|source)[^>]+src=["\']([^"\']+)', txt, re.I):
+        found.append(m.group(1))
+    for m in re.finditer(r'(?:contentUrl|file|src|url|data-src|data-video|video_url)["\']?\s*[:=]\s*["\']([^"\']+?' + VIDEO_EXT + r'[^"\']*)', txt, re.I):
+        found.append(m.group(1))
+    for m in re.finditer(r'["\'(=\s]((?:https?:)?//[^"\'\s<>()]+?' + VIDEO_EXT + r'(?:\?[^"\'\s<>()]*)?)', txt, re.I):
+        found.append(m.group(1))
+    out = []
+    for u in found:
+        u = urllib.parse.urljoin(link, u.strip())
+        if u.startswith("http") and re.search(VIDEO_EXT, u, re.I) and u not in out and not JUNK_RE.search(u):
+            out.append(u)
+    out.sort(key=lambda u: 0 if re.search(r"\.mp4", u, re.I) else (1 if ".webm" in u.lower() else 2))
+    return out
+
+
+def page_media(link: str, want_video: bool):
+    """از صفحهٔ خبر: عکس (og:image) و فهرست لینک‌های ویدیو."""
+    try:
+        page = fetch_page(link)
+    except Exception as e:
+        print("  صفحهٔ خبر باز نشد:", type(e).__name__, getattr(e, "code", ""))
+        return None, []
+    videos = find_videos(page, link) if want_video else []
+    return _meta(page, "og:image"), videos
+
+
+def debug_page(link: str):
+    """برای عیب‌یابی: نشان می‌دهد در صفحهٔ خبر چه چیزهایی دربارهٔ ویدیو هست."""
+    try:
+        page = fetch_page(link)
+    except Exception as e:
+        print("   ❌ صفحه باز نشد:", type(e).__name__, getattr(e, "code", ""))
+        return
+    print(f"   صفحه باز شد ({len(page)} نویسه)، تگ video: {len(re.findall(r'<video', page, re.I))}")
+    print("   ویدیوهای پیدا‌شده:", find_videos(page, link)[:3] or "هیچ")
+    hints = re.findall(r'(?:https?:)?//[^"\'\s<>()\\]+(?:video|player|aparat|embed|stream|media)[^"\'\s<>()\\]*', page, re.I)
+    for h in list(dict.fromkeys(hints))[:8]:
+        print("   سرنخ:", h[:140])
+    for f in re.findall(r'<iframe[^>]+src=["\']([^"\']+)', page, re.I)[:3]:
+        print("   iframe:", f[:140])
 
 
 def og_image(link: str):
@@ -307,30 +347,48 @@ def build_post(it: dict, title: str, summary: str, limit: int) -> str:
 
 
 # ───────────── ارسال ─────────────
+def ffmpeg_fetch(url: str, referer: str):
+    """ویدیوی HLS (m3u8) را با ffmpeg به mp4 تبدیل می‌کند؛ اگر بزرگ بود None."""
+    import subprocess, tempfile
+    out = os.path.join(tempfile.mkdtemp(), "v.mp4")
+    hdr = f"Referer: {referer}\r\nUser-Agent: {BROWSER_UA['User-Agent']}\r\n"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-headers", hdr, "-i", url, "-t", "900",
+                    "-c", "copy", "-bsf:a", "aac_adtstoasc", "-movflags", "+faststart", out],
+                   check=True, timeout=300)
+    if os.path.getsize(out) > VIDEO_LIMIT:
+        return None
+    with open(out, "rb") as f:
+        return f.read()
+
+
 def send_post(it: dict, title: str, summary: str):
-    """اولویت: ویدیو، بعد عکس، بعد متن ساده."""
+    """اولویت: ویدیو، بعد عکس‌ها، بعد متن ساده."""
     caption = build_post(it, title, summary, 1000)
     base = {"chat_id": CHANNEL, "caption": caption, "parse_mode": "HTML"}
     page_img = None
-    if not it.get("video"):
+    videos = [it["video"]] if it.get("video") else []
+    if not videos:
         looks_video = bool(re.search(r"ویدیو|ویدئو|فیلم|video|watch|highlights|clip", it["title"], re.I))
-        page_img, found = page_media(it["link"], looks_video)
-        if found:
-            it["video"] = found
-    if it.get("video"):
-        try:
-            tg("sendVideo", {**base, "video": it["video"], "supports_streaming": "true"})
-            return "video"
-        except TgError:
-            pass
+        page_img, videos = page_media(it["link"], looks_video)
+        if looks_video and not videos:
+            print("  🔍 ویدیو در صفحهٔ خبر پیدا نشد (برای بررسی، اجرای «test» را بزنید)")
+    for v in videos[:3]:
+        is_hls = ".m3u8" in v.lower()
+        if not is_hls:
+            try:
+                tg("sendVideo", {**base, "video": v, "supports_streaming": "true"})
+                return "video"
+            except TgError:
+                pass
         try:  # تلگرام نتوانست از لینک بگیرد؛ خودمان دانلود و آپلود می‌کنیم
-            data = download(it["video"], VIDEO_LIMIT)
+            data = ffmpeg_fetch(v, it["link"]) if is_hls else download(v, VIDEO_LIMIT, it["link"])
             if data:
                 tg("sendVideo", {**base, "supports_streaming": "true"},
                    files={"video": ("video.mp4", data, "video/mp4")}, timeout=300)
                 return "video"
+            print("  ویدیو بزرگ‌تر از ۴۸ مگابایت است:", v[:100])
         except Exception as e:
-            print("  ارسال ویدیو نشد:", type(e).__name__)
+            print("  ارسال ویدیو نشد:", type(e).__name__, getattr(e, "code", ""), v[:100])
     imgs = [upgrade_image(u) for u in it.get("images", [])]
     if len(imgs) >= 2:  # چند عکس: آلبوم
         media = [{"type": "photo", "media": u} for u in imgs]
@@ -388,6 +446,11 @@ def main():
             print(f"❌ {name}: خوانده نشد ({type(e).__name__})  ({url})")
     if TEST:
         print(f"مجموع: {len(items)} خبر. (حالت آزمایشی؛ چیزی ارسال نشد)")
+        vids = [i for i in sorted(items, key=lambda i: i["ts"], reverse=True)
+                if re.search(r"ویدیو|ویدئو|فیلم|video", i["title"], re.I)][:3]
+        for i in vids:
+            print(f"\n🎬 بررسی ویدیو: {i['title'][:60]}\n   {i['link']}\n   ویدیو در فید: {i['video']}")
+            debug_page(i["link"])
         return
     items.sort(key=lambda i: i["ts"], reverse=True)
     state = load_state()
